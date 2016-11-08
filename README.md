@@ -1,6 +1,8 @@
 Deployer
 --------
 
+[![Build Status](https://travis-ci.org/SymfoniNext/deployer.svg?branch=master)](https://travis-ci.org/SymfoniNext/deployer) [![Coverage Status](https://coveralls.io/repos/github/SymfoniNext/deployer/badge.svg)](https://coveralls.io/github/SymfoniNext/deployer)
+
 A REST API for updating Docker services with a new image.  *Running `docker service update` the fancy way.*
 
 Add this server to the end of your CD workflow, and maybe life will be *a little easier*.   A token (via HTTP headers) is used for authorisation and notifications are pushed into beanstalkd; so you can write any type of notifier you want. 
