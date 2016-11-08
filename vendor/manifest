@@ -1,0 +1,11 @@
+{
+	"version": 0,
+	"dependencies": [
+		{
+			"importpath": "github.com/go-zoo/bone",
+			"repository": "https://github.com/go-zoo/bone",
+			"revision": "ab498accda34adf6103219275fd01a50b0ffe68c",
+			"branch": "master"
+		}
+	]
+}
