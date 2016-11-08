@@ -1,0 +1,11 @@
+language: go
+go:
+  - 1.7
+  - tip
+install:
+  - go get github.com/mattn/goveralls
+  - go get -u github.com/golang/lint/golint
+script:
+  - go vet
+  - $HOME/gopath/bin/goveralls -service=travis-ci
+  - $HOME/gopath/bin/golint
