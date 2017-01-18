@@ -1,3 +1,5 @@
+services:
+  - docker
 language: go
 go:
   - 1.7
@@ -9,3 +11,6 @@ script:
   - go vet
   - $HOME/gopath/bin/goveralls -service=travis-ci
   - $HOME/gopath/bin/golint
+  - CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags '-w -extld ld -extldflags -static' -a -x -o deployer .
+  - "./deployer -notify-flags='{\"localhost\": \"local\", \"tube\": \"tube\", \"body\":\"eyJib2R5IjoiYm9keSJ9\"}' -token=asdf &"
+  - curl -v http://localhost:9999/
