@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/fsouza/go-dockerclient"
 	"github.com/go-zoo/bone"
@@ -34,17 +35,6 @@ type Deployer interface {
 type Payload struct {
 	ServiceName string
 	Artifact    string `json:"image"`
-}
-
-type Server struct {
-	Addr   string
-	Routes http.Handler
-}
-
-func (s Server) Start() {
-	log.Printf("Started server on %s", s.Addr)
-
-	http.ListenAndServe(s.Addr, s.Routes)
 }
 
 type Deploy struct {
@@ -152,10 +142,13 @@ func main() {
 		Notifier: NewNotifyBeanstalkd(nAddr, nTube, string(nBody)),
 	}
 
-	Server{
-		Addr:   listen_addr,
-		Routes: deployer.getRoutes(),
-	}.Start()
+	server := &http.Server{
+		Addr:         listen_addr,
+		Handler:      deployer.getRoutes(),
+		ReadTimeout:  time.Second * 5,
+		WriteTimeout: time.Second * 10,
+	}
+	log.Println(server.ListenAndServe())
 }
 
 func Authorize(next http.Handler) http.Handler {
