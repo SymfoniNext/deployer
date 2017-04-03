@@ -5,6 +5,7 @@
 package testing
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -134,6 +135,7 @@ func TestSetHook(t *testing.T) {
 func TestCustomHandler(t *testing.T) {
 	var called bool
 	server, _ := NewServer("127.0.0.1:0", nil, nil)
+	defer server.Stop()
 	addContainers(server, 2)
 	server.CustomHandler("/containers/json", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -153,6 +155,7 @@ func TestCustomHandler(t *testing.T) {
 func TestCustomHandlerRegexp(t *testing.T) {
 	var called bool
 	server, _ := NewServer("127.0.0.1:0", nil, nil)
+	defer server.Stop()
 	addContainers(server, 2)
 	server.CustomHandler("/containers/.*/json", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
@@ -189,6 +192,7 @@ func TestListContainers(t *testing.T) {
 			Status:  container.State.String(),
 			Ports:   container.NetworkSettings.PortMappingAPI(),
 			Names:   []string{"/" + container.Name},
+			State:   container.State.StateString(),
 		}
 	}
 	var got []docker.APIContainers
@@ -224,6 +228,7 @@ func TestListRunningContainers(t *testing.T) {
 func TestCreateContainer(t *testing.T) {
 	server := DockerServer{}
 	server.imgIDs = map[string]string{"base": "a1234"}
+	server.uploadedFiles = map[string]string{"a1234": "/abcd"}
 	server.buildMuxer()
 	recorder := httptest.NewRecorder()
 	body := `{"Hostname":"", "User":"ubuntu", "Memory":0, "MemorySwap":0, "AttachStdin":false, "AttachStdout":true, "AttachStderr":true,
@@ -257,6 +262,11 @@ func TestCreateContainer(t *testing.T) {
 	expectedBind := []string{"/var/run/docker.sock:/var/run/docker.sock:rw"}
 	if !reflect.DeepEqual(stored.HostConfig.Binds, expectedBind) {
 		t.Errorf("CreateContainer: wrong host config. Expected: %v. Returned %v.", expectedBind, stored.HostConfig.Binds)
+	}
+	if val, ok := server.uploadedFiles[stored.ID]; !ok {
+		t.Error("CreateContainer: uploadedFiles should exist.")
+	} else if val != "/abcd" {
+		t.Errorf("CreateContainer: wrong uploadedFile. Want '/abcd', got %s.", val)
 	}
 }
 
@@ -405,6 +415,7 @@ func TestRenameContainerNotFound(t *testing.T) {
 func TestCommitContainer(t *testing.T) {
 	server := DockerServer{}
 	addContainers(&server, 2)
+	server.uploadedFiles = map[string]string{server.containers[0].ID: "/abcd"}
 	server.buildMuxer()
 	recorder := httptest.NewRecorder()
 	request, _ := http.NewRequest("POST", "/commit?container="+server.containers[0].ID, nil)
@@ -418,6 +429,11 @@ func TestCommitContainer(t *testing.T) {
 	}
 	if server.images[0].Config == nil {
 		t.Error("CommitContainer: image Config should not be nil.")
+	}
+	if val, ok := server.uploadedFiles[server.images[0].ID]; !ok {
+		t.Error("CommitContainer: uploadedFiles should exist.")
+	} else if val != "/abcd" {
+		t.Errorf("CommitContainer: wrong uploadedFile. Want '/abcd', got %s.", val)
 	}
 }
 
@@ -957,6 +973,32 @@ func (r *HijackableResponseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, erro
 
 func (r *HijackableResponseRecorder) HijackBuffer() string {
 	return string(<-r.readCh)
+}
+
+func TestLogContainer(t *testing.T) {
+	server := DockerServer{}
+	addContainers(&server, 1)
+	server.containers[0].State.Running = true
+	server.buildMuxer()
+	recorder := httptest.NewRecorder()
+	path := fmt.Sprintf("/containers/%s/logs", server.containers[0].ID)
+	request, _ := http.NewRequest("GET", path, nil)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Errorf("LogContainer: wrong status. Want %d. Got %d.", http.StatusOK, recorder.Code)
+	}
+}
+
+func TestLogContainerNotFound(t *testing.T) {
+	server := DockerServer{}
+	server.buildMuxer()
+	recorder := httptest.NewRecorder()
+	path := "/containers/abc123/logs"
+	request, _ := http.NewRequest("GET", path, nil)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Errorf("LogContainer: wrong status. Want %d. Got %d.", http.StatusNotFound, recorder.Code)
+	}
 }
 
 func TestAttachContainer(t *testing.T) {
@@ -1672,6 +1714,7 @@ func TestInspectExecContainer(t *testing.T) {
 
 func TestStartExecContainer(t *testing.T) {
 	server, _ := NewServer("127.0.0.1:0", nil, nil)
+	defer server.Stop()
 	addContainers(server, 1)
 	server.buildMuxer()
 	recorder := httptest.NewRecorder()
@@ -1725,6 +1768,7 @@ func TestStartExecContainer(t *testing.T) {
 
 func TestStartExecContainerWildcardCallback(t *testing.T) {
 	server, _ := NewServer("127.0.0.1:0", nil, nil)
+	defer server.Stop()
 	addContainers(server, 1)
 	server.buildMuxer()
 	recorder := httptest.NewRecorder()
@@ -1778,6 +1822,7 @@ func TestStartExecContainerWildcardCallback(t *testing.T) {
 
 func TestStartExecContainerNotFound(t *testing.T) {
 	server, _ := NewServer("127.0.0.1:0", nil, nil)
+	defer server.Stop()
 	addContainers(server, 1)
 	server.buildMuxer()
 	recorder := httptest.NewRecorder()
@@ -1943,7 +1988,7 @@ func TestCreateNetwork(t *testing.T) {
 	netid := fmt.Sprintf("%x", rand.Int()%10000)
 	netname := fmt.Sprintf("%x", rand.Int()%10000)
 	body := fmt.Sprintf(`{"ID": "%s", "Name": "%s", "Type": "bridge" }`, netid, netname)
-	request, _ := http.NewRequest("POST", "/networks", strings.NewReader(body))
+	request, _ := http.NewRequest("POST", "/networks/create", strings.NewReader(body))
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusCreated {
 		t.Errorf("CreateNetwork: wrong status. Want %d. Got %d.", http.StatusCreated, recorder.Code)
@@ -1964,7 +2009,7 @@ func TestCreateNetworkInvalidBody(t *testing.T) {
 	server := DockerServer{}
 	server.buildMuxer()
 	recorder := httptest.NewRecorder()
-	request, _ := http.NewRequest("POST", "/networks", strings.NewReader("whaaaaaat---"))
+	request, _ := http.NewRequest("POST", "/networks/create", strings.NewReader("whaaaaaat---"))
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusBadRequest {
 		t.Errorf("CreateNetwork: wrong status. Want %d. Got %d.", http.StatusBadRequest, recorder.Code)
@@ -1978,10 +2023,38 @@ func TestCreateNetworkDuplicateName(t *testing.T) {
 	server.networks[0].Name = "mynetwork"
 	recorder := httptest.NewRecorder()
 	body := fmt.Sprintf(`{"ID": "%s", "Name": "mynetwork", "Type": "bridge" }`, fmt.Sprintf("%x", rand.Int()%10000))
-	request, _ := http.NewRequest("POST", "/networks", strings.NewReader(body))
+	request, _ := http.NewRequest("POST", "/networks/create", strings.NewReader(body))
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusForbidden {
 		t.Errorf("CreateNetwork: wrong status. Want %d. Got %d.", http.StatusForbidden, recorder.Code)
+	}
+}
+
+func TestRemoveNetwork(t *testing.T) {
+	server := DockerServer{}
+	server.buildMuxer()
+	recorder := httptest.NewRecorder()
+	server.networks = []*docker.Network{
+		{ID: "id1", Name: "name1"},
+		{ID: "id2", Name: "name2"},
+	}
+	request, _ := http.NewRequest("DELETE", "/networks/id1", nil)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Errorf("RemoveNetwork: wrong status. Want %d. Got %d.", http.StatusNoContent, recorder.Code)
+	}
+	expected := []*docker.Network{{ID: "id2", Name: "name2"}}
+	if !reflect.DeepEqual(server.networks, expected) {
+		t.Errorf("RemoveNetwork: expected networks to be %#v, got %#v", expected, server.networks)
+	}
+	request, _ = http.NewRequest("DELETE", "/networks/name2", nil)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Errorf("RemoveNetwork: wrong status. Want %d. Got %d.", http.StatusNoContent, recorder.Code)
+	}
+	expected = []*docker.Network{}
+	if !reflect.DeepEqual(server.networks, expected) {
+		t.Errorf("RemoveNetwork: expected networks to be %#v, got %#v", expected, server.networks)
 	}
 }
 
@@ -2199,6 +2272,73 @@ func TestUploadToContainer(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Errorf("UploadToContainer: wrong status. Want %d. Got %d.", http.StatusOK, recorder.Code)
 	}
+	if val, ok := server.uploadedFiles[cont.ID]; !ok {
+		t.Errorf("UploadToContainer: uploadedFiles should exist.")
+	} else if val != "abcd" {
+		t.Errorf("UploadToContainer: wrong uploadedFiles. Want 'abcd'. Got %s.", val)
+	}
+}
+
+func TestUploadToContainerWithBodyTarFile(t *testing.T) {
+	server := DockerServer{}
+	server.buildMuxer()
+	cont := &docker.Container{
+		ID: "id123",
+		State: docker.State{
+			Running:  true,
+			ExitCode: 0,
+		},
+	}
+	buf := new(bytes.Buffer)
+	tw := tar.NewWriter(buf)
+	defer tw.Close()
+	hdr := &tar.Header{
+		Name: "test.tar.gz",
+		Mode: 0600,
+		Size: int64(buf.Len()),
+	}
+	tw.WriteHeader(hdr)
+	tw.Write([]byte("something"))
+	tw.Close()
+	server.containers = append(server.containers, cont)
+	server.uploadedFiles = make(map[string]string)
+	recorder := httptest.NewRecorder()
+	request, _ := http.NewRequest("PUT", fmt.Sprintf("/containers/%s/archive?path=abcd", cont.ID), buf)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Errorf("UploadToContainer: wrong status. Want %d. Got %d.", http.StatusOK, recorder.Code)
+	}
+	if val, ok := server.uploadedFiles[cont.ID]; !ok {
+		t.Errorf("UploadToContainer: uploadedFiles should exist.")
+	} else if val != "abcd/test.tar.gz" {
+		t.Errorf("UploadToContainer: wrong uploadedFiles. Want 'abcd/test.tar.gz'. Got %s.", val)
+	}
+}
+
+func TestUploadToContainerBodyNotTarFile(t *testing.T) {
+	server := DockerServer{}
+	server.buildMuxer()
+	cont := &docker.Container{
+		ID: "id123",
+		State: docker.State{
+			Running:  true,
+			ExitCode: 0,
+		},
+	}
+	buf := bytes.NewBufferString("something")
+	server.containers = append(server.containers, cont)
+	server.uploadedFiles = make(map[string]string)
+	recorder := httptest.NewRecorder()
+	request, _ := http.NewRequest("PUT", fmt.Sprintf("/containers/%s/archive?path=abcd", cont.ID), buf)
+	server.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Errorf("UploadToContainer: wrong status. Want %d. Got %d.", http.StatusOK, recorder.Code)
+	}
+	if val, ok := server.uploadedFiles[cont.ID]; !ok {
+		t.Errorf("UploadToContainer: uploadedFiles should exist.")
+	} else if val != "abcd" {
+		t.Errorf("UploadToContainer: wrong uploadedFiles. Want 'abcd'. Got %s.", val)
+	}
 }
 
 func TestUploadToContainerMissingContainer(t *testing.T) {
@@ -2214,6 +2354,7 @@ func TestUploadToContainerMissingContainer(t *testing.T) {
 
 func TestInfoDocker(t *testing.T) {
 	server, _ := NewServer("127.0.0.1:0", nil, nil)
+	defer server.Stop()
 	addContainers(server, 1)
 	server.buildMuxer()
 	recorder := httptest.NewRecorder()
@@ -2236,10 +2377,9 @@ func TestInfoDocker(t *testing.T) {
 }
 
 func TestInfoDockerWithSwarm(t *testing.T) {
-	srv1, srv2, err := setUpSwarm()
-	if err != nil {
-		t.Fatal(err)
-	}
+	srv1, srv2 := setUpSwarm(t)
+	defer srv1.Stop()
+	defer srv2.Stop()
 	recorder := httptest.NewRecorder()
 	request, _ := http.NewRequest("GET", "/info", nil)
 	srv1.ServeHTTP(recorder, request)
@@ -2247,7 +2387,7 @@ func TestInfoDockerWithSwarm(t *testing.T) {
 		t.Fatalf("InfoDocker: wrong status. Want %d. Got %d.", http.StatusOK, recorder.Code)
 	}
 	var infoData docker.DockerInfo
-	err = json.Unmarshal(recorder.Body.Bytes(), &infoData)
+	err := json.Unmarshal(recorder.Body.Bytes(), &infoData)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2267,6 +2407,7 @@ func TestInfoDockerWithSwarm(t *testing.T) {
 
 func TestVersionDocker(t *testing.T) {
 	server, _ := NewServer("127.0.0.1:0", nil, nil)
+	defer server.Stop()
 	server.buildMuxer()
 	recorder := httptest.NewRecorder()
 	request, _ := http.NewRequest("GET", "/version", nil)
@@ -2276,18 +2417,26 @@ func TestVersionDocker(t *testing.T) {
 	}
 }
 
-func TestNetworkCreate(t *testing.T) {
-	server, _ := NewServer("127.0.0.1:0", nil, nil)
+func TestDownloadFromContainer(t *testing.T) {
+	server := DockerServer{}
 	server.buildMuxer()
+	cont := &docker.Container{
+		ID: "id123",
+		State: docker.State{
+			Running:  true,
+			ExitCode: 0,
+		},
+	}
+	server.containers = append(server.containers, cont)
+	server.uploadedFiles = make(map[string]string)
+	server.uploadedFiles[cont.ID] = "abcd"
 	recorder := httptest.NewRecorder()
-	request, _ := http.NewRequest("POST", "/networks/create", nil)
+	request, _ := http.NewRequest("GET", fmt.Sprintf("/containers/%s/archive?path=abcd", cont.ID), nil)
 	server.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
-		t.Fatalf("NetworkCreate: wrong status code. Want %d. Got %d.", http.StatusOK, recorder.Code)
+		t.Errorf("DownloadFromContainer: wrong status. Want %d. Got %d.", http.StatusOK, recorder.Code)
 	}
-	var resp map[string]string
-	json.Unmarshal(recorder.Body.Bytes(), &resp)
-	if resp["ID"] == "" {
-		t.Fatal("NetworkCreate: network id can't be empty.")
+	if recorder.HeaderMap.Get("Content-Type") != "application/x-tar" {
+		t.Errorf("DownloadFromContainer: wrong Content-Type. Want 'application/x-tar'. Got %s.", recorder.HeaderMap.Get("Content-Type"))
 	}
 }
