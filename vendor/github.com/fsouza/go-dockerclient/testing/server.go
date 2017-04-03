@@ -19,6 +19,7 @@ import (
 	mathrand "math/rand"
 	"net"
 	"net/http"
+	libpath "path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -71,6 +72,7 @@ type DockerServer struct {
 	tasks          []*swarm.Task
 	services       []*swarm.Service
 	nodeRR         int
+	servicePorts   int
 }
 
 type volumeCounter struct {
@@ -174,6 +176,8 @@ func (s *DockerServer) buildMuxer() {
 	s.mux.Path("/containers/{id:.*}/exec").Methods("POST").HandlerFunc(s.handlerWrapper(s.createExecContainer))
 	s.mux.Path("/containers/{id:.*}/stats").Methods("GET").HandlerFunc(s.handlerWrapper(s.statsContainer))
 	s.mux.Path("/containers/{id:.*}/archive").Methods("PUT").HandlerFunc(s.handlerWrapper(s.uploadToContainer))
+	s.mux.Path("/containers/{id:.*}/archive").Methods("GET").HandlerFunc(s.handlerWrapper(s.downloadFromContainer))
+	s.mux.Path("/containers/{id:.*}/logs").Methods("GET").HandlerFunc(s.handlerWrapper(s.logContainer))
 	s.mux.Path("/exec/{id:.*}/resize").Methods("POST").HandlerFunc(s.handlerWrapper(s.resizeExecContainer))
 	s.mux.Path("/exec/{id:.*}/start").Methods("POST").HandlerFunc(s.handlerWrapper(s.startExecContainer))
 	s.mux.Path("/exec/{id:.*}/json").Methods("GET").HandlerFunc(s.handlerWrapper(s.inspectExecContainer))
@@ -190,14 +194,14 @@ func (s *DockerServer) buildMuxer() {
 	s.mux.Path("/images/{id:.*}/get").Methods("GET").HandlerFunc(s.handlerWrapper(s.getImage))
 	s.mux.Path("/networks").Methods("GET").HandlerFunc(s.handlerWrapper(s.listNetworks))
 	s.mux.Path("/networks/{id:.*}").Methods("GET").HandlerFunc(s.handlerWrapper(s.networkInfo))
-	s.mux.Path("/networks").Methods("POST").HandlerFunc(s.handlerWrapper(s.createNetwork))
+	s.mux.Path("/networks/{id:.*}").Methods("DELETE").HandlerFunc(s.handlerWrapper(s.removeNetwork))
+	s.mux.Path("/networks/create").Methods("POST").HandlerFunc(s.handlerWrapper(s.createNetwork))
 	s.mux.Path("/volumes").Methods("GET").HandlerFunc(s.handlerWrapper(s.listVolumes))
 	s.mux.Path("/volumes/create").Methods("POST").HandlerFunc(s.handlerWrapper(s.createVolume))
 	s.mux.Path("/volumes/{name:.*}").Methods("GET").HandlerFunc(s.handlerWrapper(s.inspectVolume))
 	s.mux.Path("/volumes/{name:.*}").Methods("DELETE").HandlerFunc(s.handlerWrapper(s.removeVolume))
 	s.mux.Path("/info").Methods("GET").HandlerFunc(s.handlerWrapper(s.infoDocker))
 	s.mux.Path("/version").Methods("GET").HandlerFunc(s.handlerWrapper(s.versionDocker))
-	s.mux.Path("/networks/create").Methods("POST").HandlerFunc(s.handlerWrapper(s.networkCreate))
 	s.mux.Path("/swarm/init").Methods("POST").HandlerFunc(s.handlerWrapper(s.swarmInit))
 	s.mux.Path("/swarm").Methods("GET").HandlerFunc(s.handlerWrapper(s.swarmInspect))
 	s.mux.Path("/swarm/join").Methods("POST").HandlerFunc(s.handlerWrapper(s.swarmJoin))
@@ -344,7 +348,7 @@ func (s *DockerServer) DefaultHandler() http.Handler {
 	return s.mux
 }
 
-func (s *DockerServer) handlerWrapper(f func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+func (s *DockerServer) handlerWrapper(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		for errorID, urlRegexp := range s.failures {
 			matched, err := regexp.MatchString(urlRegexp, r.URL.Path)
@@ -391,6 +395,7 @@ func (s *DockerServer) listContainers(w http.ResponseWriter, r *http.Request) {
 				Command: fmt.Sprintf("%s %s", container.Path, strings.Join(container.Args, " ")),
 				Created: container.Created.Unix(),
 				Status:  container.State.String(),
+				State:   container.State.StateString(),
 				Ports:   ports,
 				Names:   []string{fmt.Sprintf("/%s", container.Name)},
 			})
@@ -460,7 +465,8 @@ func (s *DockerServer) createContainer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid container name", http.StatusInternalServerError)
 		return
 	}
-	if _, err := s.findImage(config.Image); err != nil {
+	imageID, err := s.findImage(config.Image)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
@@ -505,6 +511,9 @@ func (s *DockerServer) createContainer(w http.ResponseWriter, r *http.Request) {
 			Bridge:      "docker0",
 			Ports:       ports,
 		},
+	}
+	if val, ok := s.uploadedFiles[imageID]; ok {
+		s.uploadedFiles[container.ID] = val
 	}
 	s.cMut.Lock()
 	if container.Name != "" {
@@ -585,18 +594,37 @@ func (s *DockerServer) statsContainer(w http.ResponseWriter, r *http.Request) {
 
 func (s *DockerServer) uploadToContainer(w http.ResponseWriter, r *http.Request) {
 	id := mux.Vars(r)["id"]
-	container, _, err := s.findContainer(id)
+	_, _, err := s.findContainer(id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	if !container.State.Running {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, "Container %s is not running", id)
+	path := r.URL.Query().Get("path")
+	if r.Body != nil {
+		tr := tar.NewReader(r.Body)
+		if hdr, _ := tr.Next(); hdr != nil {
+			path = libpath.Join(path, hdr.Name)
+		}
+	}
+	s.uploadedFiles[id] = path
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *DockerServer) downloadFromContainer(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	_, _, err := s.findContainer(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 	path := r.URL.Query().Get("path")
-	s.uploadedFiles[id] = path
+	val, ok := s.uploadedFiles[id]
+	if !ok || val != path {
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprintf(w, "Path %s not found", path)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -851,6 +879,9 @@ func (s *DockerServer) commitContainer(w http.ResponseWriter, r *http.Request) {
 		}
 		s.imgIDs[repository] = image.ID
 	}
+	if val, ok := s.uploadedFiles[container.ID]; ok {
+		s.uploadedFiles[image.ID] = val
+	}
 	s.iMut.Unlock()
 	fmt.Fprintf(w, `{"ID":%q}`, image.ID)
 }
@@ -870,6 +901,35 @@ func (s *DockerServer) findContainerWithLock(idOrName string, shouldLock bool) (
 		}
 	}
 	return nil, -1, errors.New("No such container")
+}
+
+func (s *DockerServer) logContainer(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	container, _, err := s.findContainer(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+	w.WriteHeader(http.StatusOK)
+	if container.State.Running {
+		fmt.Fprintf(w, "Container is running\n")
+	} else {
+		fmt.Fprintf(w, "Container is not running\n")
+	}
+	fmt.Fprintln(w, "What happened?")
+	fmt.Fprintln(w, "Something happened")
+	if r.URL.Query().Get("follow") == "1" {
+		for {
+			time.Sleep(1e6)
+			s.cMut.RLock()
+			if !container.State.StartedAt.IsZero() && !container.State.Running {
+				s.cMut.RUnlock()
+				break
+			}
+			s.cMut.RUnlock()
+		}
+	}
 }
 
 func (s *DockerServer) buildImage(w http.ResponseWriter, r *http.Request) {
@@ -1235,6 +1295,20 @@ func (s *DockerServer) createNetwork(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(c)
 }
 
+func (s *DockerServer) removeNetwork(w http.ResponseWriter, r *http.Request) {
+	id := mux.Vars(r)["id"]
+	_, index, err := s.findNetwork(id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	s.netMut.Lock()
+	defer s.netMut.Unlock()
+	s.networks[index] = s.networks[len(s.networks)-1]
+	s.networks = s.networks[:len(s.networks)-1]
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *DockerServer) listVolumes(w http.ResponseWriter, r *http.Request) {
 	s.volMut.RLock()
 	result := make([]docker.Volume, 0, len(s.volStore))
@@ -1452,11 +1526,12 @@ func (s *DockerServer) SwarmAddress() string {
 }
 
 func (s *DockerServer) initSwarmNode(listenAddr, advertiseAddr string) (swarm.Node, error) {
-	if listenAddr == "" {
-		listenAddr = "127.0.0.1:0"
+	_, portPart, _ := net.SplitHostPort(listenAddr)
+	if portPart == "" {
+		portPart = "0"
 	}
 	var err error
-	s.swarmServer, err = newSwarmServer(s, listenAddr)
+	s.swarmServer, err = newSwarmServer(s, fmt.Sprintf("127.0.0.1:%s", portPart))
 	if err != nil {
 		return swarm.Node{}, err
 	}
@@ -1480,15 +1555,4 @@ func (s *DockerServer) initSwarmNode(listenAddr, advertiseAddr string) (swarm.No
 			Addr: fmt.Sprintf("%s:%s", hostPart, portPart),
 		},
 	}, nil
-}
-
-func (s *DockerServer) networkCreate(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	type createNetworkResponse struct {
-		ID string
-	}
-	cnr := createNetworkResponse{
-		ID: s.generateID(),
-	}
-	json.NewEncoder(w).Encode(cnr)
 }

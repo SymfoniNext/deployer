@@ -1,15 +1,31 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/go-zoo/bone"
 )
 
 var (
-	mux = bone.New()
+	mux = bone.New(Serve, Wrap)
 )
+
+func Wrap(mux *bone.Mux) *bone.Mux {
+	return mux.Prefix("/api")
+}
+
+func Serve(mux *bone.Mux) *bone.Mux {
+	mux.Serve = func(rw http.ResponseWriter, req *http.Request) {
+		tr := time.Now()
+		mux.DefaultServe(rw, req)
+		fmt.Println("Serve request from", req.RemoteAddr, "in", time.Since(tr))
+	}
+	return mux
+}
 
 func main() {
 	// Custom 404
@@ -26,7 +42,7 @@ func main() {
 	})
 
 	// Start Listening
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	log.Fatal(mux.ListenAndServe(":8080"))
 }
 
 func homeHandler(rw http.ResponseWriter, req *http.Request) {
@@ -37,7 +53,12 @@ func varHandler(rw http.ResponseWriter, req *http.Request) {
 	varr := bone.GetValue(req, "var")
 	test := bone.GetValue(req, "test")
 
-	rw.Write([]byte(varr + " " + test))
+	var args = struct {
+		first  string
+		second string
+	}{varr, test}
+
+	_ = json.NewEncoder(rw).Encode(&args)
 }
 
 func Handler404(rw http.ResponseWriter, req *http.Request) {
